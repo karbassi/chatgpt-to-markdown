@@ -20,51 +20,52 @@
     const thead = tableNode.querySelector('thead');
     const tbody = tableNode.querySelector('tbody');
 
-    // Helper to get cell text
+    // Helper to get cell text and escape pipes
     function getCellText(cell) {
-      return (cell.textContent || '').trim();
+      return cell.textContent?.trim().replaceAll('|', '\\|') ?? '';
+    }
+
+    // Helper to extract cells from a row
+    function getCellsFromRow(row) {
+      return [...row.querySelectorAll('td, th')].map(getCellText);
+    }
+
+    // Helper to format cells as markdown table row
+    function formatTableRow(cells) {
+      return `| ${cells.join(' | ')} |`;
+    }
+
+    // Helper to add header row with separator
+    function addHeaderRow(cells) {
+      rows.push(formatTableRow(cells));
+      rows.push(formatTableRow(cells.map(() => '---')));
     }
 
     // Process header
     if (thead) {
       const headerRow = thead.querySelector('tr');
       if (headerRow) {
-        const headers = Array.from(headerRow.querySelectorAll('th, td')).map(cell => {
-          return getCellText(cell);
-        });
-        rows.push('| ' + headers.join(' | ') + ' |');
-        rows.push('| ' + headers.map(() => '---').join(' | ') + ' |');
+        addHeaderRow(getCellsFromRow(headerRow));
       }
     }
 
     // Process body
     if (tbody) {
-      const bodyRows = tbody.querySelectorAll('tr');
-      bodyRows.forEach(row => {
-        const cells = Array.from(row.querySelectorAll('td, th')).map(cell => {
-          return getCellText(cell);
-        });
-        if (cells.length > 0) {
-          rows.push('| ' + cells.join(' | ') + ' |');
-        }
+      tbody.querySelectorAll('tr').forEach(row => {
+        const cells = getCellsFromRow(row);
+        if (cells.length > 0) rows.push(formatTableRow(cells));
       });
     } else {
       // If no tbody, process all tr elements directly
-      const allRows = tableNode.querySelectorAll('tr');
-      let isFirstRow = !thead; // If no thead, first row is header
-
-      allRows.forEach(row => {
-        const cells = Array.from(row.querySelectorAll('td, th')).map(cell => {
-          return getCellText(cell);
-        });
-
+      let isFirstRow = !thead;
+      tableNode.querySelectorAll('tr').forEach(row => {
+        const cells = getCellsFromRow(row);
         if (cells.length > 0) {
           if (isFirstRow) {
-            rows.push('| ' + cells.join(' | ') + ' |');
-            rows.push('| ' + cells.map(() => '---').join(' | ') + ' |');
+            addHeaderRow(cells);
             isFirstRow = false;
           } else {
-            rows.push('| ' + cells.join(' | ') + ' |');
+            rows.push(formatTableRow(cells));
           }
         }
       });
@@ -76,99 +77,173 @@
   /**
    * Convert HTML element to Markdown
    */
-  function htmlToMarkdown(element) {
+  function htmlToMarkdown(element, options = {}) {
     if (!element) return '';
 
     // Clone to avoid modifying original
     const clone = element.cloneNode(true);
 
     // Remove script, style, svg, and button elements
-    const unwanted = clone.querySelectorAll('script, style, svg, button');
-    unwanted.forEach(el => el.remove());
+    clone.querySelectorAll('script, style, svg, button').forEach(el => el.remove());
 
     // Convert HTML structure to markdown
-    return processNode(clone).trim();
+    return processNode(clone, options).trim();
+  }
+
+  /**
+   * Escape special markdown characters in text
+   */
+  function escapeMarkdown(text) {
+    return text
+      .replace(/\\/g, '\\\\')
+      .replace(/\*/g, '\\*')
+      .replace(/^-/gm, '\\-')
+      .replace(/^\+ /gm, '\\+ ')
+      .replace(/^(=+)/gm, '\\$1')
+      .replace(/^(#{1,6}) /gm, '\\$1 ')
+      .replace(/`/g, '\\`')
+      .replace(/\[/g, '\\[')
+      .replace(/\]/g, '\\]')
+      .replace(/^>/gm, '\\>')
+      .replace(/_/g, '\\_')
+      .replace(/^(\d+)\. /gm, '$1\\. ');
+  }
+
+  /**
+   * Collapse whitespace in text nodes (like Turndown does)
+   * Preserves single newlines but collapses multiple newlines and spaces
+   */
+  function collapseWhitespace(text, preserveNewlines = false) {
+    if (preserveNewlines) {
+      // Preserve newlines but collapse spaces/tabs
+      return text
+        .replace(/[ \t]+/g, ' ')     // collapse spaces and tabs
+        .replace(/\n{3,}/g, '\n\n'); // max 2 consecutive newlines
+    }
+    // Default behavior: collapse all whitespace to single space
+    return text.replace(/[ \t\r\n]+/g, ' ');
+  }
+
+  /**
+   * Check if node is blank/empty
+   */
+  function isBlank(node) {
+    return (
+      node.nodeType === Node.ELEMENT_NODE &&
+      !node.querySelector('img, hr, br, table') &&
+      /^\s*$/.test(node.textContent)
+    );
+  }
+
+  /**
+   * Check if a node is inside a list item
+   */
+  function isInsideListItem(node) {
+    let parent = node.parentElement;
+    while (parent) {
+      if (parent.tagName && parent.tagName.toLowerCase() === 'li') {
+        return true;
+      }
+      parent = parent.parentElement;
+    }
+    return false;
   }
 
   /**
    * Process a node and its children, converting to markdown
    */
-  function processNode(node) {
+  function processNode(node, { isCode = false, noEscape = false } = {}) {
     if (!node) return '';
 
-    // Text node
+    // Skip blank nodes
+    if (isBlank(node)) return '';
+
+    // Text node - escape markdown and collapse whitespace
     if (node.nodeType === Node.TEXT_NODE) {
-      return node.textContent;
+      const text = isCode ? node.textContent : collapseWhitespace(node.textContent);
+      // Don't escape if we're in assistant markdown content or in code
+      return (isCode || noEscape) ? text : escapeMarkdown(text);
     }
 
     // Element node
     if (node.nodeType === Node.ELEMENT_NODE) {
       const tag = node.tagName.toLowerCase();
-      let content = '';
 
-      // Process children
-      const children = Array.from(node.childNodes);
-      const childContent = children.map(child => processNode(child)).join('');
+      // Determine if we're in a code context
+      const isCodeContext = isCode || tag === 'code' || tag === 'pre';
+
+      // Process children with appropriate options
+      const childContent = [...node.childNodes].map(child =>
+        processNode(child, {
+          isCode: isCodeContext && tag !== 'pre',
+          noEscape
+        })
+      ).join('');
 
       switch (tag) {
         case 'h1':
-          return `# ${childContent.trim()}\n\n`;
         case 'h2':
-          return `## ${childContent.trim()}\n\n`;
         case 'h3':
-          return `### ${childContent.trim()}\n\n`;
         case 'h4':
-          return `#### ${childContent.trim()}\n\n`;
         case 'h5':
-          return `##### ${childContent.trim()}\n\n`;
         case 'h6':
-          return `###### ${childContent.trim()}\n\n`;
+          // Extract heading level from tag name (h1 -> 1, h2 -> 2, etc.)
+          const level = parseInt(tag[1]);
+          return `${'#'.repeat(level)} ${childContent.trim()}\n\n`;
 
         case 'p':
-          // Check if we're inside a list item
-          let currentParent = node.parentElement;
-          while (currentParent) {
-            if (currentParent.tagName.toLowerCase() === 'li') {
-              // Inside a list item, don't add extra newlines
-              return childContent.trim();
-            }
-            currentParent = currentParent.parentElement;
+          // Inside a list item, don't add extra newlines
+          if (isInsideListItem(node)) {
+            return childContent.trim();
           }
           return `${childContent.trim()}\n\n`;
 
         case 'strong':
         case 'b':
-          return `**${childContent}**`;
+          return childContent.trim() ? `**${childContent}**` : '';
 
         case 'em':
         case 'i':
-          return `*${childContent}*`;
+          return childContent.trim() ? `*${childContent}*` : '';
+
+        case 's':
+        case 'del':
+        case 'strike':
+          return childContent.trim() ? `~~${childContent}~~` : '';
+
+        case 'sup':
+          return childContent.trim() ? `<sup>${childContent}</sup>` : '';
+
+        case 'sub':
+          return childContent.trim() ? `<sub>${childContent}</sub>` : '';
 
         case 'code':
           // Check if this is inside a pre tag (code block)
-          if (node.parentElement && node.parentElement.tagName.toLowerCase() === 'pre') {
+          if (node.parentElement?.tagName.toLowerCase() === 'pre') {
             return childContent;
           }
-          return `\`${childContent}\``;
+          // Handle inline code - escape backticks by using multiple backticks if needed
+          if (!childContent) return '';
+          const inlineCode = childContent.replace(/\r?\n|\r/g, ' ');
+          const hasBacktick = inlineCode.includes('`');
+          const delimiter = hasBacktick ? '``' : '`';
+          const extraSpace = /^`|^ /.test(inlineCode) || /`$| $/.test(inlineCode) ? ' ' : '';
+          return `${delimiter}${extraSpace}${inlineCode}${extraSpace}${delimiter}`;
 
         case 'pre':
-          return `\`\`\`\n${childContent.trim()}\n\`\`\`\n\n`;
+          const codeElement = node.querySelector('code');
+          const className = codeElement?.getAttribute('class') ?? '';
+          const language = className.match(/language-(\S+)/)?.[1] ?? '';
+          const code = codeElement?.textContent ?? childContent;
+          return `\`\`\`${language}\n${code.trim()}\n\`\`\`\n\n`;
 
         case 'ul':
         case 'ol':
-          // Check if we're nested inside another list item
-          let isNested = false;
-          let parentCheck = node.parentElement;
-          while (parentCheck) {
-            if (parentCheck.tagName && parentCheck.tagName.toLowerCase() === 'li') {
-              isNested = true;
-              break;
-            }
-            parentCheck = parentCheck.parentElement;
-          }
+          // Skip empty lists
+          if (!childContent.trim()) return '';
 
-          if (isNested) {
-            // For nested lists, indent each line
+          // Nested lists need indentation
+          if (isInsideListItem(node)) {
             const lines = childContent.trim().split('\n');
             return '\n' + lines.map(line => '  ' + line).join('\n') + '\n';
           }
@@ -178,45 +253,64 @@
           // Check if parent is ol or ul
           const parent = node.parentElement;
 
-          // Check if this list item contains a nested list
-          const hasNestedList = node.querySelector('ul, ol');
-
-          let content;
-          if (hasNestedList) {
-            // Keep the structure for nested lists
-            content = childContent.trim();
-          } else {
-            // For simple list items, collapse internal whitespace
-            content = childContent.trim().replace(/\n+/g, ' ');
+          // Check for task list checkbox (before processing children)
+          const checkbox = node.querySelector('input[type="checkbox"]');
+          let taskListPrefix = '';
+          if (checkbox) {
+            taskListPrefix = checkbox.checked ? '[x] ' : '[ ] ';
           }
 
-          if (parent && parent.tagName.toLowerCase() === 'ol') {
-            const index = Array.from(parent.children).indexOf(node) + 1;
-            return `${index}. ${content}\n`;
+          // Clone node and remove checkbox to prevent it from appearing in content
+          const liClone = node.cloneNode(true);
+          liClone.querySelector('input[type="checkbox"]')?.remove();
+
+          // Process the cloned content without checkbox
+          const liContent = [...liClone.childNodes].map(child =>
+            processNode(child, { isCode, noEscape })
+          ).join('');
+
+          // Process content and handle nested lists
+          let content = liContent
+            .replace(/^\n+/, '') // remove leading newlines
+            .replace(/\n+$/, '\n'); // replace trailing newlines with just a single one
+
+          // Indent continuation lines (not the first line)
+          const lines = content.split('\n');
+          if (lines.length > 1) {
+            content = `${lines[0]}\n${lines.slice(1).map(line => `  ${line}`).join('\n')}`;
           }
-          return `- ${content}\n`;
+
+          // Determine prefix
+          let prefix = '- ';
+          if (parent?.tagName.toLowerCase() === 'ol') {
+            const start = parent.getAttribute('start');
+            const index = [...parent.children].indexOf(node);
+            prefix = `${start ? Number(start) + index : index + 1}. `;
+          }
+
+          return `${prefix}${taskListPrefix}${content}${node.nextSibling && !/\n$/.test(content) ? '\n' : ''}`;
 
         case 'blockquote':
-          const lines = childContent.trim().split('\n');
-          return lines.map(line => `> ${line}`).join('\n') + '\n\n';
+          const quoteLines = childContent.trim().split('\n');
+          return quoteLines.map(line => `> ${line}`).join('\n') + '\n\n';
 
         case 'hr':
           return '---\n\n';
 
         case 'a':
           const href = node.getAttribute('href');
-          if (href) {
-            return `[${childContent}](${href})`;
-          }
-          return childContent;
+          if (!href) return childContent;
+          const title = node.getAttribute('title');
+          const titlePart = title ? ` "${title.replaceAll('"', '\\"')}"` : '';
+          return `[${childContent}](${href}${titlePart})`;
 
         case 'img':
           const src = node.getAttribute('src');
-          const alt = node.getAttribute('alt') || '';
-          if (src) {
-            return `![${alt}](${src})`;
-          }
-          return '';
+          if (!src) return '';
+          const alt = node.getAttribute('alt') ?? '';
+          const imgTitle = node.getAttribute('title');
+          const imgTitlePart = imgTitle ? ` "${imgTitle.replaceAll('"', '\\"')}"` : '';
+          return `![${alt}](${src}${imgTitlePart})`;
 
         case 'br':
           return '\n';
@@ -224,13 +318,8 @@
         case 'table':
           return convertTableToMarkdown(node);
 
-        case 'div':
-        case 'span':
-        case 'article':
-        case 'section':
-          return childContent;
-
         default:
+          // Pass through container elements (div, span, article, section, etc.)
           return childContent;
       }
     }
@@ -240,6 +329,7 @@
 
   /**
    * Extract text content from an element, preserving structure
+   * For user messages, we preserve line breaks as they typed them
    */
   function extractTextContent(element) {
     if (!element) return '';
@@ -248,14 +338,18 @@
     const clone = element.cloneNode(true);
 
     // Remove any script or style elements
-    const scripts = clone.querySelectorAll('script, style, svg, button');
-    scripts.forEach(el => el.remove());
+    clone.querySelectorAll('script, style, svg, button').forEach(el => el.remove());
 
     // Get text content
-    let text = clone.textContent || '';
+    let text = clone.textContent ?? '';
 
-    // Clean up whitespace
-    text = text.trim();
+    // For user messages, preserve newlines but clean up excessive spacing
+    text = text
+      .replace(/[ \t]+/g, ' ')        // collapse consecutive spaces/tabs
+      .replace(/\n[ \t]+/g, '\n')     // remove spaces at start of lines
+      .replace(/[ \t]+\n/g, '\n')     // remove spaces at end of lines
+      .replace(/\n{3,}/g, '\n\n')     // max 2 consecutive newlines
+      .trim();
 
     return text;
   }
@@ -265,11 +359,12 @@
    */
   function extractMarkdownContent(element) {
     // For assistant messages, try to preserve the markdown structure
+    // Don't escape markdown characters since ChatGPT already provides formatted content
     const markdownDiv = element.querySelector('.markdown');
     if (markdownDiv) {
-      return htmlToMarkdown(markdownDiv);
+      return htmlToMarkdown(markdownDiv, { noEscape: true });
     }
-    return htmlToMarkdown(element);
+    return htmlToMarkdown(element, { noEscape: true });
   }
 
   /**
@@ -287,21 +382,14 @@
    * Main export function
    */
   function exportChatToMarkdown() {
-    console.log('🚀 Starting ChatGPT export to Markdown...');
-
     // Get the conversation title
     const titleElement = document.querySelector('title');
-    const conversationTitle = titleElement ? titleElement.textContent.replace(' | ChatGPT', '') : 'ChatGPT Conversation';
+    const conversationTitle = titleElement?.textContent.replace(' | ChatGPT', '') ?? 'ChatGPT Conversation';
 
     // Find all conversation turns (articles with data-testid containing "conversation-turn")
     const turns = document.querySelectorAll('article[data-testid^="conversation-turn"]');
 
-    if (turns.length === 0) {
-      console.error('❌ No conversation messages found. Make sure you\'re on a ChatGPT conversation page.');
-      return;
-    }
-
-    console.log(`📝 Found ${turns.length} messages`);
+    if (turns.length === 0) return;
 
     // Build markdown content
     let markdown = `# ${conversationTitle}\n\n`;
@@ -310,13 +398,8 @@
 
     // Process each turn
     turns.forEach((turn, index) => {
-      const role = turn.getAttribute('data-turn');
       const messageDiv = turn.querySelector('[data-message-author-role]');
-
-      if (!messageDiv) {
-        console.warn(`⚠️  Skipping message ${index + 1}: No message content found`);
-        return;
-      }
+      if (!messageDiv) return;
 
       const actualRole = messageDiv.getAttribute('data-message-author-role');
 
@@ -334,24 +417,18 @@
         content = extractTextContent(messageDiv);
       }
 
-      if (!content) {
-        console.warn(`⚠️  Skipping message ${index + 1}: Empty content`);
-        return;
-      }
+      if (!content) return;
 
       // Format the message based on role
       if (actualRole === 'user') {
-        markdown += `## User\n\n`;
-        markdown += `${content}\n\n`;
+        markdown += `## User\n${content}`;
       } else if (actualRole === 'assistant') {
-        markdown += `## Assistant\n\n`;
-        markdown += `${content}\n\n`;
+        markdown += `## Assistant\n${content}`;
       } else {
-        markdown += `## ${actualRole}\n\n`;
-        markdown += `${content}\n\n`;
+        markdown += `## ${actualRole}\n${content}`;
       }
 
-      markdown += `---\n\n`;
+      markdown += `\n---\n\n`;
     });
 
     // Clean up excessive whitespace
@@ -377,18 +454,10 @@
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
 
-    console.log(`✅ Export complete! Downloaded as: ${filename}`);
-    console.log(`📊 Exported ${turns.length} messages`);
-
     // Return the markdown for inspection if needed
     return markdown;
   }
 
   // Run the export
-  try {
-    const result = exportChatToMarkdown();
-    console.log('\n✨ You can also access the markdown content by typing: result');
-  } catch (error) {
-    console.error('❌ Error during export:', error);
-  }
+  exportChatToMarkdown();
 })();
